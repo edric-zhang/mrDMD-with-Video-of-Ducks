@@ -366,6 +366,8 @@ end
 
 
 %% 1. Calculate Dynamically the L4 Boundaries
+
+% HERE WE ARE JUST FINDING WHERE L4 STARTS
 col_idx = find(~cellfun(@isempty, available_modes(4, :))); 
 num_L4_modes = size(available_modes{4, col_idx}, 2);      
 modes_before_L4 = 0;
@@ -375,17 +377,11 @@ for r = 1:3
         modes_before_L4 = modes_before_L4 + size(available_modes{r, active_col}, 2);
     end
 end
-% FIX 1 & 3: Fixed variable typo AND added +1 to account for the 'ones' column in lift_matrix
 L4_start_col = modes_before_L4 + 1 + 1; 
 
-%% ========================================================================
-%%                       COMPLETE SINDy AUTOMATION SCRIPT
-%% ========================================================================
+% HERE BASICALLY ALL WE ARE DOING IS GETTING MY AVAILABLE LEVEL 1 - 3 MODES 
+% FROM MY TIME PERIOD, AND ADDING THEM TOGETHER INTO ONE MATRIX
 
-%% ========================================================================
-%%            SINDY SQUEEZE: COMPRESSED AUTOMATION SCRIPT
-%% ========================================================================
-% --- Step 1: Flatten available_modes into matrices ---
 all_modes_matrix = [];
 library_modes_matrix = []; 
 [num_rows, num_cols] = size(available_modes);
@@ -401,54 +397,48 @@ for r = 1:num_rows
     end
 end
 
-% Set up refresh control
+
 refresh_Xi = true;
 if exist('Xi', 'var') && ~refresh_Xi
     fprintf('Matrix "Xi" already exists. Skipping regression loop.\n');
 else
-    % --- THE SINDY SQUEEZE (SVD Compression) ---
-    fprintf('Applying SINDy Squeeze via economy SVD...\n');
-    tic;
-    % library_modes_matrix is (n x M). We compress the spatial dimension 'n' down to 'M'
+    % BIG STEP FOR COMPUTATION - USING SVD ON FULL MATRIX TO SAVE MEMORY
     [U_squeeze, S_squeeze, ~] = svd(library_modes_matrix, 'econ');
-    
-    % Project both our library and our Level 4 targets into this tiny coordinate space
-    % library_squeezed becomes (M x M), Y_targets_squeezed becomes (M x num_L4_modes)
     library_squeezed = S_squeeze; 
     
+    % PROJECTING AVAILABLE LEVEL 4 MODES TO THE SVD SPACE OF LEVELS 1-3
     col_idx = find(~cellfun(@isempty, available_modes(4, :)));
-    Y_targets = available_modes{4, col_idx}; 
+    Y_targets = available_modes{4, col_idx}; % Y_TARGET IS LEVEL 4 MODES
     Y_targets_squeezed = U_squeeze' * Y_targets; 
     
+    % M IS STILL THE NUMBER OF 1-3 MODES!!!
     [M_dim, M] = size(library_squeezed);
     num_L4_modes = size(Y_targets, 2); 
     num_features = 1 + M + (M * (M + 1) / 2); 
     toc;
 
-    % --- Step 2: Generate the Tiny Dictionary ---
+    % STEP 2 - GENERATING THE COMPRESSED DICTIONARY
     fprintf('Building compressed dictionary (Size: %d x %d)...\n', M_dim, num_features);
     tic;
-    % We pass the tiny (M x M) matrix to createdict instead of the (57600 x M) matrix!
     Theta_tiny = createdict(library_squeezed); 
     toc;
     
-    % --- Step 3: Fast, Memory-Safe STLSQ Loop via Normal Equations ---
+    % STEP 3 - STLSQ ALGORITHM - NORMAL EQUATIONS
     lambda = 0.15;       
     max_iter = 25;      
     alpha = 1e-7;       
     
     fprintf('Computing Normal Equations on tiny matrices...\n');
     tic;
-    % Standardize column variances
+    % HERE WE NORMALIZE ALL THE COLUMNS OF OUR THETA DICTIONARY
     column_scales = sqrt(sum(Theta_tiny.^2, 1)); 
     column_scales(column_scales == 0) = 1; 
     Theta_scaled = Theta_tiny ./ column_scales;
     
-    % Compute the stabilized Normal Equations matrix (Size: num_features x num_features)
+    % SETTING UP NORMAL EQUATIONS FOR LEAST SQUARES: 
+    % FORMAT IS: ATAX = ATB, WHERE Y_PROJECTED IS ATB
     A_full = Theta_scaled' * Theta_scaled; 
     A_full = A_full + alpha * eye(size(A_full, 1)); 
-    
-    % Project targets using the scaled dictionary
     Y_projected = Theta_scaled' * Y_targets_squeezed; 
     toc;
     
@@ -457,19 +447,21 @@ else
     
     fprintf('Starting STLSQ loop with lambda = %.2f...\n', lambda);
     tic;
-    for idx = 1:num_L4_modes
-        b = Y_projected(:, idx);
+    % FOR EACH L4 MODE
+    % TRYING TO FIND X IN ATAX = ATB
+    for idx = 1:num_L4_modes 
+        b = Y_projected(:, idx); % b here is actually AtB.  Inversing AtA.
         xi_active = A_full \ b; 
         active_inds = true(size(xi_active));
         
         for iter = 1:max_iter
             small_inds = abs(xi_active) < lambda;
             if ~any(small_inds & active_inds), break; end
-            
+            % FINDING SMALLEST COEFFICIENTS (XI_ACTIVE), SETTING TO ZERO
             xi_active(small_inds) = 0; 
             active_inds(small_inds) = false; 
             if ~any(active_inds), break; end 
-            
+            % DOES THIS AGAIN
             xi_active(active_inds) = A_full(active_inds, active_inds) \ b(active_inds);
         end
         Xi_scaled(:, idx) = xi_active;
@@ -481,7 +473,8 @@ else
     
     fprintf('Done! Xi equations computed using 99%% less memory.\n');
 end
-%% Quick Lambda Diagnostic Sweep
+
+%% Quick Lambda Diagnostic Sweep (used for next trial)
 lambda_test_values = [0.01, 0.05, 0.1, 0.2, 0.3, 0.4];
 
 fprintf('\n=== LAMBDA DIAGNOSTIC SWEEP ===\n');
@@ -494,6 +487,11 @@ for L = lambda_test_values
     for iter = 1:5
         small_inds = abs(xi_test) < L;
         xi_test(small_inds) = 0;
+        % SUPER IMPORTANT. ACTIVE INDEXES ARE THE ONES THAT HAVE NOT BEEN
+        % LABELED AS GARBAGE YET. IT'S FULL OF TRUE'S AND FALSE'S.  ONCE A
+        % TERM FALLS BELOW LAMBDA, IT'S PUT IN THE GARBAGE. SO WHEN THE NEW
+        % ITERATION RUNS, THAT SAME TERM MIGHT FALL BELOW LAMBDA AGAIN.
+        % WHY? BECAUSE THE SMALL, USELESS RELATIONSHIPS ARE REMOVED. 
         active_inds = xi_test ~= 0;
         if ~any(active_inds), break; end
         xi_test(active_inds) = A_full(active_inds, active_inds) \ b(active_inds);
@@ -504,21 +502,19 @@ for L = lambda_test_values
 end
 fprintf('================================\n');
 
-%% Analyzing the Xi Equations:
 %% 5. Analyze and Print Discovered Level 4 Equations
 
-% Create a cell array of string labels matching how createdict(Modes) is built
+% BASICALLY JUST GIVING NAMES/LABELS FOR ALL THE TYPES OF TERMS IN THE
+% DICTIONARY.  THIS JUST INCLUDES 1, MODES, CROSS-MODES. 
+
 M = size(all_modes_matrix, 2); % Number of linear modes (100)
 feature_labels = cell(1, num_features);
-
 % Label 1: The constant term
 feature_labels{1} = '1';
-
 % Labels 2 to M+1: The linear modes
 for i = 1:M
     feature_labels{i+1} = sprintf('phi_%d', i);
 end
-
 % Labels M+2 onward: The cross-product combinations (Mode_i * Mode_j)
 col_idx = M + 2;
 for i = 1:M
@@ -530,11 +526,10 @@ end
 
 fprintf('\n================ DISCOVERED LEVEL 4 EQUATIONS ================\n');
 
-% Loop through each of your 25 Level 4 target modes
+% Loop through each of the Level 4 target modes
 for idx = 1:num_L4_modes
-    % Get the sparse coefficient vector for the current L4 mode
+    % For each column (corresponding to each level 4 target mode)
     coef_vector = Xi(:, idx);
-
     % Find the rows where SINDy left a non-zero weight
     active_idx = find(coef_vector ~= 0);
 
