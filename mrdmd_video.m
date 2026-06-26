@@ -1,5 +1,5 @@
 close all;
-refresh = false;
+refresh = true;
 
 if refresh || ~exist('X_total', 'var')
     clc;
@@ -197,7 +197,11 @@ if total_spatial_elements == 14400        % New highly reduced grayscale matrix
 elseif total_spatial_elements == 43200   % Your current dataset
     vid_height = 180;                     
     vid_width = 240;                      
-    num_channels = 1;                     
+    num_channels = 1;                   
+elseif total_spatial_elements == 57600   % Your crisp, compact grayscale dataset
+    vid_height = 180;                     
+    vid_width = 320;                      
+    num_channels = 1;
 elseif total_spatial_elements == 691200   % Old 360p color matrix
     vid_height = 360;
     vid_width = 640;
