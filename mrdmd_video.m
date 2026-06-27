@@ -229,7 +229,7 @@ plot_end_idx   = 187;
 % Format: [Level, Bin (j), Mode_Index] (Use 0 as a wildcard for ALL)
 % Use 1,0,0 - 2,0,0 - 3,0,0 - 4,0,0 for full period-specific reconstruction
 target_coordinates = [
-    3, 2, 13;   
+    2, 1, 4;   
     %2, 0, 0; 
     %3, 0, 0;
     %4, 0, 0;
@@ -276,8 +276,13 @@ fprintf('===========================================================\n\n');
 
 % HERE WE ARE JUST FINDING WHERE L4 STARTS
 col_idx = find(~cellfun(@isempty, available_modes(4, :))); 
-num_L4_modes = size(available_modes{4, col_idx}, 2);      
-modes_before_L4 = 0;
+%num_L4_modes = size(available_modes{4, col_idx}, 2);      
+Y_targets = [];
+for c = col_idx
+    Y_targets = [Y_targets, available_modes{4, c}];
+end
+num_L4_modes = size(Y_targets, 2);
+modes_before_L4 = 0; 
 for r = 1:3
     active_col = find(~cellfun(@isempty, available_modes(r, :)), 1);
     if ~isempty(active_col)
@@ -324,12 +329,23 @@ if exist('Xi', 'var') && ~refresh_Xi
     fprintf('Matrix "Xi" already exists. Skipping regression loop.\n');
 else
     % BIG STEP FOR COMPUTATION - USING SVD ON FULL MATRIX TO SAVE MEMORY
-    [U_squeeze, S_squeeze, ~] = svd(library_modes_matrix, 'econ');
+    [U_squeeze, S_squeeze, V_squeeze] = svd(library_modes_matrix, 'econ');
+    % Energy threshold - keep modes that carry meaningful variance
+    singular_vals = diag(S_squeeze);
+    total_energy = sum(singular_vals.^2);
+    cumulative_energy = cumsum(singular_vals.^2) / total_energy;
+    energy_threshold = 0.999;  % keep modes explaining 99.9% of energy
+    keep_idx = find(cumulative_energy <= energy_threshold);
+    fprintf('Energy filter: keeping %d of %d SVD modes (%.1f%% energy threshold)\n', ...
+        length(keep_idx), length(singular_vals), energy_threshold*100);
+    U_squeeze = U_squeeze(:, keep_idx);
+    V_squeeze = V_squeeze(:, keep_idx);
+    S_squeeze = S_squeeze(keep_idx, keep_idx);
     library_squeezed = S_squeeze; 
-    
+        
     % PROJECTING AVAILABLE LEVEL 4 MODES TO THE SVD SPACE OF LEVELS 1-3
     col_idx = find(~cellfun(@isempty, available_modes(4, :)));
-    Y_targets = available_modes{4, col_idx}; % Y_TARGET IS LEVEL 4 MODES
+    %Y_targets = available_modes{4, col_idx}; % Y_TARGET IS LEVEL 4 MODES
     Y_targets_squeezed = U_squeeze' * Y_targets; 
     
     % M IS STILL THE NUMBER OF 1-3 MODES!!!
@@ -343,7 +359,7 @@ else
     tic;
     Theta_tiny = createdict(library_squeezed); 
     toc;
-    clear library_modes_matrix library_squeezed U_squeeze S_squeeze;
+    clear library_modes_matrix library_squeezed U_squeeze;
     
     % STEP 3 - STLSQ ALGORITHM - NORMAL EQUATIONS
     lambda = 0.15;       
@@ -487,83 +503,65 @@ for idx = 1:num_L4_modes
 end
 fprintf('==============================================================\n');
 
-%% FINAL PLOTTING TO SEE THE MODES IN ACTION
+%% POST-PROCESSING: Map SVD directions back to original library modes
 
-% EXTRACTION ENGINE
-%{
-X_level_extract = zeros(n, m);
-fprintf('--- Extracting Multi-Target Components ---\n');
+fprintf('\n================ PHYSICAL MODE MAPPING ================\n');
 
-num_targets = size(target_coordinates, 1);
+% V_squeeze columns correspond to SVD directions (after energy filtering)
+% But in your working code you didn't save V_squeeze - need to recompute
+% Add this line when you first do the SVD (save V alongside U and S):
+% [U_squeeze, S_squeeze, V_squeeze] = svd(library_modes_matrix, 'econ');
 
-for idx = 1:num_targets
-    req_i    = target_coordinates(idx, 1);
-    req_j    = target_coordinates(idx, 2);
-    req_mode = target_coordinates(idx, 3);
+% For now, assuming you saved V_squeeze. Each column of V is a 
+% linear combination of original library modes for that SVD direction.
+% V is total_library_modes x M_dim (e.g. 75 x 75)
 
-    if req_i > L || req_i < 1
-        warning('Target row %d: Level %d out of bounds. Skipping.', idx, req_i);
-        continue;
-    end
-
-    max_J = 2^(req_i-1);
-    if req_j == 0
-        bins_to_process = 1:max_J;
-    else
-        if req_j > max_J || req_j < 0
-            warning('Target row %d: Bin %d out of bounds for Level %d. Skipping.', idx, req_j, req_i);
-            continue;
-        end
-        bins_to_process = req_j;
-    end
-
-    for j = bins_to_process
-        if isempty(list_modes{req_i, j}), continue; end
-
-        modes     = list_modes{req_i, j};
-        eigs_slow = list_w{req_i, j};
-        b         = list_b{req_i, j};
-        t_start   = list_t_start(req_i, j);
-        bin_width = list_bin_widths(req_i, j);
-        if bin_width == 0, continue; end
-
-        t_end = t_start + bin_width - 1;
-        num_modes_available = size(modes, 2);
-
-        if req_mode == 0
-            modes_to_process = 1:num_modes_available;
-        else
-            if req_mode > num_modes_available || req_mode < 0
-                continue; 
+% Build a map of original phi index -> bin/level/mode
+phi_labels = cell(total_library_modes, 1);
+phi_counter = 1;
+for r = 1:num_rows
+    for c = 1:num_cols
+        if ~isempty(available_modes{r, c}) && r < 4
+            nm = size(available_modes{r, c}, 2);
+            for mode_k = 1:nm
+                phi_labels{phi_counter} = sprintf('L%d B%d Mode%d', r, c, mode_k);
+                phi_counter = phi_counter + 1;
             end
-            modes_to_process = req_mode;
         end
-
-        selected_modes = modes(:, modes_to_process);
-        selected_eigs  = eigs_slow(modes_to_process);
-        selected_b     = b(modes_to_process);
-
-        mag = abs(selected_eigs);
-        over = mag > 1.0;
-        selected_eigs(over) = selected_eigs(over) ./ mag(over);
-
-        time_powers = selected_eigs .^ (0:bin_width-1);
-        local_rec   = selected_modes * (selected_b .* time_powers);
-
-        if t_end > m
-            t_end = m;
-            local_rec = local_rec(:, 1:(t_end - t_start + 1));
-        end
-
-        X_level_extract(:, t_start:t_end) = X_level_extract(:, t_start:t_end) + local_rec;
     end
-
-    str_j = iif(req_j==0, 'ALL', num2str(req_j));
-    str_m = iif(req_mode==0, 'ALL', num2str(req_mode));
-    fprintf('Loaded Entry %d -> Level: %d | Bin: %s | Mode: %s\n', idx, req_i, str_j, str_m);
 end
-X_level_extract = real(X_level_extract);
-%}
+
+% For each active SVD direction in your equations, show which original
+% modes contribute most
+fprintf('Top original mode contributors per active SVD direction:\n\n');
+
+% Find which SVD directions actually appeared in any equation
+active_svd_dirs = find(any(Xi ~= 0, 2));  % rows of Xi that are nonzero
+
+% Only look at linear terms (rows 2 to M_dim+1 in Xi)
+% Row 1 = constant, rows 2:M_dim+1 = linear SVD terms
+linear_active = active_svd_dirs(active_svd_dirs >= 2 & active_svd_dirs <= M_dim + 1);
+svd_dir_indices = linear_active - 1;  % convert to 1-based SVD direction index
+
+for k = 1:length(svd_dir_indices)
+    svd_idx = svd_dir_indices(k);
+
+    % The svd_idx-th column of V tells us how this SVD direction 
+    % mixes the original library modes
+    v_col = abs(V_squeeze(:, svd_idx));  % 75x1, magnitude of each original mode's contribution
+
+    % Sort to find top contributors
+    [sorted_contrib, sort_order] = sort(v_col, 'descend');
+    top_n = min(5, length(sort_order));  % show top 5 contributors
+
+    fprintf('SVD direction phi_%d (singular value = %.4f):\n', svd_idx, S_squeeze(svd_idx, svd_idx));
+    for t = 1:top_n
+        orig_idx = sort_order(t);
+        fprintf('   %.1f%%  %s\n', 100 * sorted_contrib(t) / sum(v_col), phi_labels{orig_idx});
+    end
+    fprintf('\n');
+end
+fprintf('========================================================\n');
 
 
 % Plotting Loop
