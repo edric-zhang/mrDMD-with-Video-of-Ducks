@@ -1,0 +1,578 @@
+close all;
+clc;
+clear;
+
+refresh = true;
+if refresh || ~exist('X', 'var')
+    clc;
+    clear;
+    fprintf('Loading ducks_snapshot_matrix.mat...\n');
+    load('ducks_snapshot_matrix.mat'); % This loads the 'ducks' matrix into workspace
+    X = single(ducks);
+    clear ducks;
+end
+
+vid_width  = 320;   % e.g., 320 pixels
+vid_height = 180;   % e.g., 240 pixels
+num_channels = 1;   % 1 for Grayscale, 3 for RGB Color
+%% Setting the parameters
+X_total_size = size(X,2);
+frame_start = 1;
+frame_end   = X_total_size;
+X = X(:, frame_start:frame_end);
+[n, m] = size(X);
+numsnapshots = size(X, 2);   % keep this as full video length
+
+dt = 5e-4;                               % True time step (0.0005 seconds) - Given my CONFIG
+total_time = dt * (m - 1);               % True total duration of analyzed snapshots
+t = (0:dt:total_time)';
+%% STARTING MRDMD
+L = 4; 
+maxJ = 2^(L-1); 
+matrices = cell(1, maxJ);       % List of matrices that we update to run DMD through
+matrices{1} = X;
+
+% Tracking variables
+list_ml = zeros(L, maxJ);           % List of truncation number for each level, bin
+list_b = cell(L, maxJ);             % List of starting vector coefficients for each level, bin mode
+list_w = cell(L, maxJ);             % List of eigenvalues for each level, bin mode
+list_modes = cell(L, maxJ);         % List of modes for each level, bin
+list_bin_widths = zeros(L, maxJ);   % List of bin widths for each level, bin
+list_t_start = zeros(L, maxJ);      % List of bin start points for each level, bin
+list_t_start(1,1) = 1;
+list_bin_widths(1,1) = m;
+freq_threshold_hz = 1000;
+
+for i = 1:L
+    J = 2^(i-1);
+    next_matrices = cell(1, 2*J);   % Setting an empty list of matrices for the NEXT level
+    count = 1;                      % Used to go to the next spot in the next_matrices list
+    
+    for j = 1:J
+        A = matrices{j};            % Get the next matrix from the previous matrices list
+        
+        if isempty(A) || size(A, 2) < 10 || any(isnan(A(:)))    % If A is empty or too small, 
+            next_matrices{count} = []; count = count + 1;       % then add an empty matrix for the 
+            next_matrices{count} = []; count = count + 1;       % next list and skip the process
+            continue;
+        end
+        
+        current_start = list_t_start(i, j);                     % For (1,1), starts at 0
+        current_width = size(A, 2);
+        list_bin_widths(i, j) = current_width;                  % For (1,1), starts at 0
+        
+        level_dt = dt;                                          % So we set dt = 0.0005 seconds earlier
+        [modes, D, b] = dmd(A);                                 % Run DMD
+        timeperiod = size(D, 1);                                % Size of D (depends on our r value)
+        
+        
+        % Calculate continuous frequencies
+        freqs = zeros(timeperiod, 1);                   
+        for modenum = 1:timeperiod
+            lambda = D(modenum, modenum);                       % For each number in our number of modes
+            omega = log(lambda) / level_dt;                     % Making this a continuous eigenvalue
+            freqs(modenum) = abs(imag(omega)) / (2 * pi);       % Finding the corresponding frequency
+        end
+        
+
+        [sorted_freqs, sort_idx] = sort(freqs);                 % Sort frequencies ascending
+        D = D(sort_idx, sort_idx);                              % Sort D, modes, and b in the same way
+        modes = modes(:, sort_idx);
+        b = b(sort_idx);
+        
+        ml = find(sorted_freqs >= freq_threshold_hz, 1, 'first'); % Find the first frequency to be higher than the threshold
+        
+        if isempty(ml)                                          % If none are higher, it flags ALL MODES
+            ml = timeperiod + 1;                                % as being SLOW MODES
+            slow_inds = 1:timeperiod;
+        else
+            slow_inds = 1:(ml-1);                               % Or else it flags all up to that index
+        end
+        
+        if ~isempty(slow_inds)                                  % As long as there exist slow modes
+            eigs_slow = diag(D(slow_inds, slow_inds));
+            mag = abs(eigs_slow);                               
+            over = mag > 1.0;                                   % If the magnitude of the discrete eigenvalues
+            eigs_slow(over) = eigs_slow(over) ./ mag(over);     % is greater than 1, project it onto 1 unit circle
+                                                                
+            time_powers = eigs_slow .^ (0:current_width-1);     % basically Omega Matrix
+            slowmatrix = modes(:, slow_inds) * (b(slow_inds) .* time_powers);
+        else
+            slowmatrix = zeros(n, current_width, 'like', X);              % If there are no slow modes, just make zeros
+        end
+        
+        fastmatrix = A - slowmatrix; 
+        clear A slowmatrix;
+        % Storing all the variables
+        list_ml(i, j) = ml;                                     
+        list_w{i, j} = diag(D(slow_inds, slow_inds));           % Store eigenvalues as a vector
+        list_b{i, j} = b(slow_inds);
+        list_modes{i, j} = modes(:, slow_inds);
+        
+        % Splitting Step: Split the new fastmatrix into half
+        midpoint = floor(current_width / 2);
+        A1 = fastmatrix(:, 1:midpoint);
+        A2 = fastmatrix(:, (midpoint + 1):end);
+        clear fastmatrix;
+        left_child_idx = 2*j - 1;
+        next_matrices{left_child_idx} = A1;
+        right_child_idx = 2*j;
+        next_matrices{right_child_idx} = A2;
+        if i < L
+            list_t_start(i+1, left_child_idx) = current_start;             % Setting starts for the NEXT LEVEL
+            list_bin_widths(i+1, left_child_idx) = midpoint;
+
+            list_t_start(i+1, right_child_idx) = current_start + midpoint;
+            list_bin_widths(i+1, right_child_idx) = current_width - midpoint;
+        end
+        
+    clear A1 A2 modes D b freqs sorted_freqs sort_idx time_powers eigs_slow mag over;
+    end
+    matrices = next_matrices; % Update the new matrix list
+    clear next_matrices;
+end
+clear matrices next_matrices
+clear A1 A2 A fastmatrix slowmatrix;
+
+%% Reconstruction Loop
+
+X_rec = zeros(n, m, 'like', X);
+for i = 1:L
+    J = 2^(i-1);
+    for j = 1:J
+        if isempty(list_modes{i, j})
+            continue;
+        end
+        modes = list_modes{i, j};
+        eigs_slow = list_w{i, j};
+        b = list_b{i, j};
+        
+        t_start = list_t_start(i, j);                                      % Setting start/end - modes only exist locally
+        bin_width = list_bin_widths(i, j);
+        
+        if bin_width == 0
+            continue;
+        end
+        
+        t_end = t_start + bin_width - 1;
+        mag = abs(eigs_slow);
+        over = mag > 1.0;                                                  % Project eigs>1 to 1
+        eigs_slow(over) = eigs_slow(over) ./ mag(over);
+        
+        time_powers = eigs_slow .^ (0:bin_width-1);
+        local_rec = modes * (b .* time_powers);
+        
+        % Protect against matrix index rounding overflows at tree boundaries
+        if t_end > m                                                       % Make overflow over m into m
+            t_end = m;
+            local_rec = local_rec(:, 1:(t_end - t_start + 1));
+        end
+
+        X_rec(:, t_start:t_end) = X_rec(:, t_start:t_end) + local_rec;     % Add on the local mode data
+        clear local_rec time_powers modes eigs_slow b mag over;
+    end
+end
+X_rec = real(X_rec); 
+
+%{
+%% Quick display of what we got: 
+total_modes = 0;
+for i = 1:L
+    J = 2^(i-1);
+    for j = 1:J
+        if ~isempty(list_modes{i,j})
+            % The number of columns equals the number of modes in this bin
+            num_modes_in_bin = size(list_modes{i,j}, 2); 
+            total_modes = total_modes + num_modes_in_bin;
+            fprintf('Level %d, Bin %d has %d slow modes\n', i, j, num_modes_in_bin);
+        end
+    end
+end
+fprintf('--- Total modes across all time windows: %d ---\n', total_modes);
+%}
+
+%% Error Graph
+
+mrdmd_error = NaN(1, numsnapshots); 
+for k = 1:m
+    true_snapshot = X(:, k);
+    rec_snapshot  = X_rec(:, k);
+    
+    % Shift the tracking index to map precisely onto the absolute X_total timeline
+    absolute_idx = frame_start + k - 1;
+    mrdmd_error(absolute_idx) = norm(true_snapshot - rec_snapshot) / (norm(true_snapshot) + eps);
+end
+
+figure('Units', 'normalized', 'Position', [0.1, 0.1, 0.6, 0.5]);
+
+% Plotting against the absolute indices preserves the alignment layout
+plot(mrdmd_error * 100, 'r-', 'LineWidth', 1.5, 'DisplayName', 'MRDMD');
+hold on;
+xlim([1, numsnapshots]); % Lock the visual frame boundary to the total absolute snapshots
+ylim([0 200]);
+grid on;
+legend('Location', 'best');
+xlabel('Snapshot (Absolute Timeline)'); 
+ylabel('Error %');
+title('Snapshot-wise Reconstruction Performance');
+clear X_rec true_snapshot rec_snapshot local_rec time_powers;
+
+
+
+%% MULTI-TARGET EXTRACTION WITH ACTIVE LOOKUP MENU
+plot_start_idx = 188; 
+num_plot_snaps = X_total_size;
+plot_end_idx   = plot_start_idx + num_plot_snaps - 1;
+plot_end_idx   = 250;
+
+
+% Format: [Level, Bin (j), Mode_Index] (Use 0 as a wildcard for ALL)
+% Use 1,0,0 - 2,0,0 - 3,0,0 - 4,0,0 for full period-specific reconstruction
+target_coordinates = [
+    2, 1, 4;   
+    %2, 0, 0; 
+    %3, 0, 0;
+    %4, 0, 0;
+];
+
+fprintf('\n===========================================================');
+fprintf('\n   AVAILABLE COORDINATES FOR FRAMES %d TO %d', plot_start_idx, plot_end_idx);
+fprintf('\n===========================================================\n');
+
+
+available_modes = cell(L,maxJ);
+
+for i = 1:L
+    J = 2^(i-1);
+    for j = 1:J
+        if isempty(list_modes{i, j}), continue; end
+        
+        t_start   = list_t_start(i, j);
+        bin_width = list_bin_widths(i, j);
+        t_end     = t_start + bin_width - 1;
+        
+        % Check if this bin overlaps with our visual playback window
+        if t_start <= plot_end_idx && t_end >= plot_start_idx
+            num_modes_available = size(list_modes{i, j}, 2);
+            available_modes{i,j} = list_modes{i,j};
+            fprintf('● Level %d, Bin %d (Frames %d to %d)\n', i, j, t_start, t_end);
+            fprintf('  └─ Available Mode Indices: [');
+            for m_idx = 1:num_modes_available
+                if m_idx == num_modes_available
+                    fprintf('%d', m_idx);
+                else
+                    fprintf('%d, ', m_idx);
+                end
+            end
+            fprintf(']\n\n');
+        end
+    end
+end
+fprintf('===========================================================\n\n');
+
+
+
+
+%% WEAK SINDY ON MRDMD TEMPORAL COEFFICIENTS
+% Goal:
+% Learn d/dt of Level 4 modal amplitudes using Level 1-4 modal amplitudes.
+%
+% This replaces the old spatial regression:
+%   L4 spatial modes = Theta(L1-L3 spatial modes)*Xi
+%
+% with actual dynamics:
+%   d(a_L4)/dt = Theta(a_L1,a_L2,a_L3,a_L4)*Xi
+
+
+%% 4. Run WSINDy
+
+fprintf('\nRunning weak SINDy on mrDMD modal amplitudes...\n');
+tic;
+
+input_levels = [1 2 3];
+target_level = 4;
+
+[w_sparse, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsindy( ...
+    list_w, list_b, list_modes, list_t_start, list_bin_widths, ...
+    dt, m, input_levels, target_level, plot_start_idx, plot_end_idx);
+
+toc;
+
+
+
+
+%% 5. Print only Level 4 derivative equations
+
+fprintf('\n================ DISCOVERED LEVEL 4 WEAK SINDY EQUATIONS ================\n');
+
+for kk = 1:length(target_cols)
+
+    target_col = target_cols(kk);
+    coef_vector = w_sparse(:, target_col);
+
+    print_tol = 1e-6 * max(abs(coef_vector));
+    active_idx = find(abs(coef_vector) > print_tol);
+
+    fprintf('\nEquation for d/dt of %s:\n', mode_labels{target_col});
+
+    if isempty(active_idx)
+        fprintf('    d(%s)/dt = 0\n', mode_labels{target_col});
+        continue;
+    end
+
+    equation_str = sprintf('    d(%s)/dt = ', mode_labels{target_col});
+
+    for q = 1:length(active_idx)
+
+        row = active_idx(q);
+        weight = coef_vector(row);
+
+        % WSINDy tags are not always directly pretty, so print tag row index too
+        if row <= length(mode_labels)
+            label = mode_labels{row};
+        else
+            label = sprintf('Theta_%d', row);
+        end
+
+        if q == 1
+            equation_str = sprintf('%s %.4e * %s', equation_str, weight, label);
+        else
+            if weight >= 0
+                equation_str = sprintf('%s + %.4e * %s', equation_str, weight, label);
+            else
+                equation_str = sprintf('%s - %.4e * %s', equation_str, abs(weight), label);
+            end
+        end
+    end
+
+    fprintf('%s\n', equation_str);
+end
+
+fprintf('\n==========================================================================\n');
+
+%% 6. Optional: show which state columns correspond to which mrDMD modes
+
+fprintf('\n================ WSINDY STATE INDEX MAP ================\n');
+for k = 1:length(mode_labels)
+    fprintf('State x_%d = %s\n', k, mode_labels{k});
+end
+fprintf('========================================================\n');
+
+
+
+% Plotting Loop
+h_extract_fig = figure('Position', [150, 150, 1200, 500], 'Name', 'Streaming Target Mode Viewer');
+
+% Iterate only through the frames you want to watch
+for k = plot_start_idx:plot_end_idx
+    if ~ishandle(h_extract_fig), break; end
+
+    % Initialize a zero frame (Size: n x 1)
+    frame_ext = zeros(n, 1, 'like', X);
+
+    % --- STREAMING EXTRACTION ---
+    % Instead of pre-calculating all frames, we find the bin for this specific frame k
+    for idx = 1:size(target_coordinates, 1)
+        req_i    = target_coordinates(idx, 1);
+        req_j    = target_coordinates(idx, 2);
+        req_mode = target_coordinates(idx, 3);
+
+        % Identify which bin covers frame k for this Level/Bin
+        % We check all bins in that level to see which one contains k
+        max_J = 2^(req_i-1);
+        for j = 1:max_J
+            if isempty(list_modes{req_i, j}), continue; end
+
+            t_start = list_t_start(req_i, j);
+            bin_width = list_bin_widths(req_i, j);
+            t_end = t_start + bin_width - 1;
+
+            
+
+            % If this bin contains our current frame k:
+            if k >= t_start && k <= t_end
+                modes     = list_modes{req_i, j};
+                eigs_slow = list_w{req_i, j};
+                b         = list_b{req_i, j};
+
+                % Determine which mode index to use
+                if req_mode == 0
+                    m_list = 1:size(modes,2);
+                else
+                    m_list = req_mode;
+                end
+
+                % Relative time power for this specific frame
+                time_offset = k - t_start;
+                time_powers = (eigs_slow(m_list)) .^ time_offset;
+
+                % Add the contribution directly to our current frame buffer
+                frame_ext = frame_ext + (modes(:, m_list) * (b(m_list) .* time_powers));
+            end
+        end
+    end
+
+    % --- PLOTTING ---
+    set(0, 'CurrentFigure', h_extract_fig);
+    absolute_idx = frame_start + k - 1;
+
+    % Convert 1D column back to video shape
+    frame_orig = reshape(X(:,k), [vid_width, vid_height])';
+    frame_ext_view = reshape(real(frame_ext), [vid_width, vid_height])';
+
+    subplot(1, 2, 1); imshow(frame_orig, []);
+    title(sprintf('Original (Frame %d)', absolute_idx));
+
+    subplot(1, 2, 2); imshow(frame_ext_view, []);
+    title(sprintf('Target Mode Extraction (Frame %d)', absolute_idx));
+
+    drawnow;
+    % No pause needed if you want it to run as fast as possible
+end
+
+
+
+%% FUNCTIONS
+function [modes, D, b] = dmd(X)
+    X1 = X(:, 1:end-1);
+    Y = X(:, 2:end);
+    [U, S, V] = svds(X1, 25);
+    %{
+    thresh = 1e-8 * sing_vals(1);
+    r = sum(sing_vals > thresh);
+    r = min([25, r, size(U, 2)]); 
+    %}
+    r = 25;
+    if r == 0, r = 1; end
+    U = U(:, 1:r);
+    S = S(1:r, 1:r);
+    V = V(:, 1:r);
+    
+    A = (U' * Y * V) / S;
+    [W, D] = eig(A);
+    
+    modes = single(Y * V * (S \ W));
+    b = single(pinv(modes) * X1(:, 1)); 
+end
+
+
+
+function [w_sparse, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsindy( ...
+    list_w, list_b, list_modes, list_t_start, list_bin_widths, ...
+    dt, m, input_levels, target_level, plot_start_idx, plot_end_idx)
+
+    m_interval = plot_end_idx - plot_start_idx + 1;
+
+    xobs = [];
+    mode_labels = {};
+    mode_levels = [];
+    Lmax = size(list_modes, 1);
+
+    for lev = 1:Lmax
+        J = 2^(lev-1);
+
+        for bin = 1:J
+            if isempty(list_modes{lev, bin})
+                continue;
+            end
+
+            eigs_slow = list_w{lev, bin};
+            b = list_b{lev, bin};
+            bin_width = list_bin_widths(lev, bin);
+            t_start = list_t_start(lev, bin);
+            t_end = t_start + bin_width - 1;
+
+            if bin_width <= 1 || t_end > m
+                continue;
+            end
+
+            % Keep only bins overlapping chosen interval
+            if t_start > plot_end_idx || t_end < plot_start_idx
+                continue;
+            end
+
+            % Clip this bin to the selected interval
+            local_start = max(t_start, plot_start_idx);
+            local_end   = min(t_end, plot_end_idx);
+
+            rel_start = local_start - t_start;
+            rel_end   = local_end - t_start;
+
+            insert_start = local_start - plot_start_idx + 1;
+            insert_end   = local_end   - plot_start_idx + 1;
+
+            for mode_idx = 1:length(eigs_slow)
+                a_local = b(mode_idx) * eigs_slow(mode_idx).^(rel_start:rel_end);
+
+                a_full = zeros(m_interval, 1);
+                a_full(insert_start:insert_end) = real(a_local(:));
+
+                xobs = [xobs, a_full];
+                mode_labels{end+1} = sprintf('L%d B%d Mode%d', lev, bin, mode_idx);
+                mode_levels(end+1) = lev;
+            end
+        end
+    end
+
+    tobs = (0:m_interval-1)' * dt;
+
+    keep_cols = ismember(mode_levels, [input_levels, target_level]);
+    xobs = xobs(:, keep_cols);
+    mode_labels = mode_labels(keep_cols);
+    mode_levels = mode_levels(keep_cols);
+    target_cols = find(mode_levels == target_level);
+
+    weights = [];
+    polys = 1;
+    trigs = [];
+    custom_tags = [];
+    custom_fcns = {};
+    phi_class = 1;
+    max_d = 1;
+    tau = 10^-16;
+    tauhat = -1;
+
+    K_frac = min(50, floor(m_interval/2));
+
+    overlap_frac = 1;
+    relax_AG = 0;
+    scale_Theta = 2;
+    useGLS = 0;
+
+    lambda = 0.03;
+
+    gamma = 0;
+    alpha_loss = 0.8;
+    overlap_frac_ag = 0.8;
+    mt_ag_fac = [1;0];
+    pt_ag_fac = [1;0];
+    run_sindy = 0;
+    useFD = 2;
+    smoothing_window = 0;
+ 
+ %{
+    lambda_test_values = [0.008 0.01 0.012 0.015 0.018 0.02 0.025 0.03];
+
+    fprintf('\n=== WSINDY LAMBDA SWEEP ===\n');
+
+    for lam = lambda_test_values
+        [w_test,~,~,~,~,~,~,~,~,~,~,~,~,~,~,~,~,~,~,~,~] = ...
+            wsindy_ode_fun(xobs,tobs,[],...
+            polys,trigs,custom_tags,custom_fcns,...
+            phi_class,max_d,tau,tauhat,K_frac,overlap_frac,relax_AG,...
+            scale_Theta,useGLS,lam,gamma,alpha_loss,...
+            overlap_frac_ag,pt_ag_fac,mt_ag_fac,run_sindy,useFD,smoothing_window);
+
+        W = w_test(:, target_cols);
+        fprintf('lambda %.4g | active terms total: %d | max coef: %.2e\n', ...
+            lam, nnz(W), max(abs(W(:))));
+    end
+%}
+
+    [w_sparse,~,~,~,~,~,~,~,~,~,~,~,~,~,~,tags,~,~,~,~,~] = ...
+        wsindy_ode_fun(xobs,tobs,weights,...
+        polys,trigs,custom_tags,custom_fcns,...
+        phi_class,max_d,tau,tauhat,K_frac,overlap_frac,relax_AG,...
+        scale_Theta,useGLS,lambda,gamma,alpha_loss,...
+        overlap_frac_ag,pt_ag_fac,mt_ag_fac,run_sindy,useFD,smoothing_window);
+end
