@@ -1,8 +1,8 @@
 close all;
-clc;
-clear;
+%clc;
+%clear;
 
-refresh = true;
+refresh = false;
 if refresh || ~exist('X', 'var')
     clc;
     clear;
@@ -292,7 +292,7 @@ tic;
 input_levels = [1 2 3];
 target_level = 4;
 
-[w_sparse, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsindy( ...
+[w_linear, w_second, labels_second, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsindy( ...
     list_w, list_b, list_modes, list_t_start, list_bin_widths, ...
     dt, m, input_levels, target_level, plot_start_idx, plot_end_idx);
 
@@ -308,7 +308,7 @@ fprintf('\n================ DISCOVERED LEVEL 4 WEAK SINDY EQUATIONS ============
 for kk = 1:length(target_cols)
 
     target_col = target_cols(kk);
-    coef_vector = w_sparse(:, target_col);
+    coef_vector = w_linear(:, target_col);
 
     print_tol = 1e-6 * max(abs(coef_vector));
     active_idx = find(abs(coef_vector) > print_tol);
@@ -350,14 +350,49 @@ end
 
 fprintf('\n==========================================================================\n');
 
-%% 6. Optional: show which state columns correspond to which mrDMD modes
+fprintf('\n================ SECOND-PASS LEVEL 4 EQUATIONS ================\n');
 
-fprintf('\n================ WSINDY STATE INDEX MAP ================\n');
-for k = 1:length(mode_labels)
-    fprintf('State x_%d = %s\n', k, mode_labels{k});
+for kk = 1:length(target_cols)
+
+    target_col = target_cols(kk);
+    coef_vector = w_second{kk};
+    labels2 = labels_second{kk};
+
+    print_tol = 1e-6 * max(abs(coef_vector));
+    active_idx = find(abs(coef_vector) > print_tol);
+
+    fprintf('\nEquation for d/dt of %s:\n', mode_labels{target_col});
+
+    if isempty(active_idx)
+        fprintf('    d(%s)/dt = 0\n', mode_labels{target_col});
+        continue;
+    end
+
+    equation_str = sprintf('    d(%s)/dt = ', mode_labels{target_col});
+
+    for q = 1:length(active_idx)
+        row = active_idx(q);
+        weight = coef_vector(row);
+
+        if row <= length(labels2)
+            label = labels2{row};
+        else
+            label = sprintf('Theta_%d', row);
+        end
+
+        if q == 1
+            equation_str = sprintf('%s %.4e * %s', equation_str, weight, label);
+        else
+            if weight >= 0
+                equation_str = sprintf('%s + %.4e * %s', equation_str, weight, label);
+            else
+                equation_str = sprintf('%s - %.4e * %s', equation_str, abs(weight), label);
+            end
+        end
+    end
+
+    fprintf('%s\n', equation_str);
 end
-fprintf('========================================================\n');
-
 
 
 % Plotting Loop
@@ -455,9 +490,7 @@ function [modes, D, b] = dmd(X)
     b = single(pinv(modes) * X1(:, 1)); 
 end
 
-
-
-function [w_sparse, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsindy( ...
+function [w_linear, w_second, labels_second, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsindy(...
     list_w, list_b, list_modes, list_t_start, list_bin_widths, ...
     dt, m, input_levels, target_level, plot_start_idx, plot_end_idx)
 
@@ -539,7 +572,8 @@ function [w_sparse, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsin
     scale_Theta = 2;
     useGLS = 0;
 
-    lambda = 0.03;
+    lambda1 = 0.016;
+    lambda2 = 0.010;
 
     gamma = 0;
     alpha_loss = 0.8;
@@ -550,7 +584,7 @@ function [w_sparse, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsin
     useFD = 2;
     smoothing_window = 0;
  
- %{
+    %{
     lambda_test_values = [0.008 0.01 0.012 0.015 0.018 0.02 0.025 0.03];
 
     fprintf('\n=== WSINDY LAMBDA SWEEP ===\n');
@@ -567,12 +601,82 @@ function [w_sparse, tags, xobs, tobs, mode_labels, target_cols] = run_mrdmd_wsin
         fprintf('lambda %.4g | active terms total: %d | max coef: %.2e\n', ...
             lam, nnz(W), max(abs(W(:))));
     end
-%}
+    %}
 
     [w_sparse,~,~,~,~,~,~,~,~,~,~,~,~,~,~,tags,~,~,~,~,~] = ...
         wsindy_ode_fun(xobs,tobs,weights,...
         polys,trigs,custom_tags,custom_fcns,...
         phi_class,max_d,tau,tauhat,K_frac,overlap_frac,relax_AG,...
-        scale_Theta,useGLS,lambda,gamma,alpha_loss,...
+        scale_Theta,useGLS,lambda1,gamma,alpha_loss,...
         overlap_frac_ag,pt_ag_fac,mt_ag_fac,run_sindy,useFD,smoothing_window);
+
+    w_linear = w_sparse;
+
+    w_second = cell(length(target_cols),1);
+    labels_second = cell(length(target_cols),1);
+
+    n_base = size(xobs,2);
+
+    for kk = 1:length(target_cols)
+
+        target_col = target_cols(kk);
+
+        % ---- active linear terms from first pass ----
+        coef1 = w_linear(:, target_col);
+        tol1 = 1e-6 * max(abs(coef1));
+
+        active_linear = find(abs(coef1(1:n_base)) > tol1);
+
+        % Remove the target itself if it appeared
+        active_linear(active_linear == target_col) = [];
+
+       % ---- build second-pass observed state matrix ----
+    xobs2 = [];
+    labels2 = {};
+    
+    % active first-pass linear variables only
+    for a = 1:length(active_linear)
+        ii = active_linear(a);
+    
+        xobs2 = [xobs2, xobs(:,ii)];
+        labels2{end+1} = mode_labels{ii};
+    end
+    
+    % add target itself
+    xobs2 = [xobs2, xobs(:,target_col)];
+    labels2{end+1} = mode_labels{target_col};
+    target_col2 = length(labels2);
+    
+    % self quadratics: xi^2 only for active first-pass modes
+    for a = 1:length(active_linear)
+        ii = active_linear(a);
+    
+        xobs2 = [xobs2, xobs(:,ii).^2];
+        labels2{end+1} = sprintf('(%s)^2', mode_labels{ii});
+    end
+    
+    % cross coupling: xi*xj only among active first-pass modes
+    for a = 1:length(active_linear)
+        for b = a+1:length(active_linear)
+            ii = active_linear(a);
+            jj = active_linear(b);
+    
+            xobs2 = [xobs2, xobs(:,ii).*xobs(:,jj)];
+            labels2{end+1} = sprintf('(%s)*(%s)', ...
+                mode_labels{ii}, mode_labels{jj});
+        end
+    end
+    
+    % ---- second pass is still linear in the augmented columns ----
+    [w2,~,~,~,~,~,~,~,~,~,~,~,~,~,~,tags2,~,~,~,~,~] = ...
+        wsindy_ode_fun(xobs2,tobs,weights,...
+        polys,trigs,custom_tags,custom_fcns,...
+        phi_class,max_d,tau,tauhat,K_frac,overlap_frac,relax_AG,...
+        scale_Theta,useGLS,lambda2,gamma,alpha_loss,...
+        overlap_frac_ag,pt_ag_fac,mt_ag_fac,run_sindy,useFD,smoothing_window);
+
+        w_second{kk} = w2(:, target_col2);
+        labels_second{kk} = labels2;
+    end
+    
 end
