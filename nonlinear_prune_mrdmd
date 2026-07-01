@@ -296,8 +296,8 @@ tic;
 
 input_levels = [1 2];
 target_level = 3;
-top_input_modes_per_level = 3;
-top_target_modes = 4;
+top_input_modes_per_level = 5;
+top_target_modes = 6;
 
 [w_linear, w_second, labels_second, tags, xobs, tobs, mode_labels, target_cols, mu_xobs, sigma_xobs] = run_mrdmd_wsindy( ...
     list_w, list_b, list_modes, list_t_start, list_bin_widths, ...
@@ -817,8 +817,8 @@ function [w_linear, w_second, labels_second, tags, xobs, tobs, mode_labels, targ
     scale_Theta = 2;
     useGLS = 0;
 
-    lambda1 = 0.006;
-    lambda2 = 0.004;
+    lambda1 = 0.002;
+    lambda2 = 0.001;
 
     gamma = 1e-2;
     include_l3_peer_coupling = true;
